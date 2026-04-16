@@ -42,6 +42,9 @@ from langfuse._client.propagation import propagate_attributes
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from openclaw.tracer import Tracer
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -89,102 +92,44 @@ def observed_chat(
 ) -> dict:
     """
     Send a chat to OpenClaw gateway and record a full Langfuse generation
-    with proper Input/Output + agent-layer attributes.
+    using the shared tracer (StartGen/End pattern).
     """
     token = _load_gateway_token()
     session_id = session_id or f"observe-{int(time.time())}"
+    tracer = Tracer.create(langfuse)
 
-    # propagate_attributes sets trace-level context (session, user, name)
-    with propagate_attributes(
-        trace_name="openclaw.chat",
-        session_id=session_id,
-        user_id=user_id or "observe",
-    ):
-        # start_as_current_observation creates an OTel span that Langfuse renders
-        with langfuse.start_as_current_observation(
-            name="openclaw.generation",
-            as_type="generation",
-            input=messages,
-            model=model,
-            model_parameters={"max_tokens": 4096},
-        ) as generation:
-            t0 = time.perf_counter()
+    span = tracer.start_gen(
+        "/v1/chat/completions", session_id, user_id or "observe", messages
+    )
 
-            try:
-                resp = httpx.post(
-                    f"{GATEWAY_URL}/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": model,
-                        "messages": messages,
-                        "max_tokens": 4096,
-                    },
-                    timeout=120.0,
-                )
-                resp.raise_for_status()
-                response_body = resp.json()
-            except Exception as e:
-                generation.update(
-                    output={"error": str(e)},
-                    level="ERROR",
-                    status_message=str(e),
-                )
-                raise
+    try:
+        resp = httpx.post(
+            f"{GATEWAY_URL}/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json={"model": model, "messages": messages, "max_tokens": 4096},
+            timeout=120.0,
+        )
+        resp.raise_for_status()
+        response_body = resp.json()
+    except Exception as e:
+        span.end("", {}, err=e)
+        raise
 
-            duration_ms = (time.perf_counter() - t0) * 1000.0
+    choice = response_body["choices"][0]
+    output_text = choice["message"].get("content", "") or ""
+    usage = response_body.get("usage", {})
+    # Map OpenAI-style keys to the tracer's expected format
+    usage_mapped = {
+        "input_tokens": usage.get("prompt_tokens", 0),
+        "output_tokens": usage.get("completion_tokens", 0),
+        "total_tokens": usage.get("total_tokens", 0),
+    }
 
-            # Extract response
-            choice = response_body["choices"][0]
-            output_message = choice["message"]
-            usage = response_body.get("usage", {})
-            prompt_tokens = usage.get("prompt_tokens", 0)
-            completion_tokens = usage.get("completion_tokens", 0)
-
-            # Agent-layer: context pressure
-            context_limit = 128000
-            context_pressure = round(prompt_tokens / context_limit, 4) if context_limit else 0
-
-            # Agent-layer: output efficiency
-            output_text = output_message.get("content", "") or ""
-            chars_per_token = round(
-                len(output_text) / max(completion_tokens, 1), 2
-            )
-
-            # Update the generation with output + usage + agent metadata
-            generation.update(
-                output=output_message,
-                model=response_body.get("model", model),
-                usage_details={
-                    "input": prompt_tokens,
-                    "output": completion_tokens,
-                    "total": usage.get("total_tokens", 0),
-                },
-                metadata={
-                    "duration_ms": round(duration_ms, 1),
-                    "finish_reason": choice.get("finish_reason"),
-                    "gateway": GATEWAY_URL,
-                    # Agent-layer attributes
-                    "agent.context_pressure": context_pressure,
-                    "agent.chars_per_output_token": chars_per_token,
-                    "agent.context_pressure_warning": context_pressure > 0.8,
-                },
-            )
-
-            # Also set OTel span attributes for the raw OTel layer
-            span = trace.get_current_span()
-            span.set_attribute("gen_ai.system", "openclaw")
-            span.set_attribute("gen_ai.request.model", model)
-            span.set_attribute("gen_ai.response.model", response_body.get("model", model))
-            span.set_attribute("gen_ai.usage.input_tokens", prompt_tokens)
-            span.set_attribute("gen_ai.usage.output_tokens", completion_tokens)
-            span.set_attribute("agent.context_pressure", context_pressure)
-            span.set_attribute("agent.duration_ms", round(duration_ms, 1))
-            span.set_attribute("agent.total_tokens", usage.get("total_tokens", 0))
-
-    langfuse.flush()
+    span.end(output_text, usage_mapped)
+    tracer.flush()
     return response_body
 
 
