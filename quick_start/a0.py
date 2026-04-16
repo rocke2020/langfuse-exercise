@@ -30,7 +30,7 @@ completion = client.chat.completions.create(
             "role": "system",
             "content": "You are a very accurate calculator. You output only the result of the calculation.",
         },
-        {"role": "user", "content": "1 + 1 = "},
+        {"role": "user", "content": "1 + 11 = "},
     ],
     metadata={"someMetadataKey": "someValue"},
 )
