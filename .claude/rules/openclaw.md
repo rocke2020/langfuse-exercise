@@ -1,6 +1,6 @@
 ---
 paths:
-  - "openclaw/**"
+  - "openclaw/**/*"
 ---
 # General Rules for openclaw 
 
